@@ -93,3 +93,8 @@ for a in states:
             num = num - 1
 print(cntInAircrafts, cntgood, cnt)
 '''
+
+
+
+# dd.weather.gc.ca/model_gem_global/15km/grib2/lat_lon/
+# 00/$shift$/CMC_glb_DEPR_ISBL_$level$_latlon.15x.15_$date$00_P$shift$.grib2
