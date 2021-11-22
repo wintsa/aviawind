@@ -3,7 +3,7 @@ from operator import itemgetter
 import json
 import urllib.request
 import pandas as pd
-from math import sqrt
+from math import sqrt, cos, sin, radians
 import matplotlib.pyplot as plt
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -27,9 +27,11 @@ def getAircraftSpeed(aircrafts):
     aircraftModelSpeeds = pd.read_csv(r'../data/speed.csv')  # [['model', 'speed']]
     aircraftSpeeds = pd.merge(aircrafts, aircraftModelSpeeds, on="typecode")
     speedDict = dict()
+    typeDict = dict()
     for a in aircraftSpeeds.to_dict('records'):
         speedDict[a['icao24']] = a['speed']
-    return speedDict
+        typeDict[a['icao24']] = a['typecode']
+    return speedDict, typeDict
 
 
 # levels = pd.read_csv(r'../data/levels.csv')
@@ -65,11 +67,11 @@ def getLevel(z):
 # print(df)
 
 def loadStates():
-    # data = urllib.request.urlopen("https://opensky-network.org/api/states/all").read()
-    # with open('temp.json', 'wb') as file:
-    #        file.write(data)
-    with open('temp.json', 'rb') as fin:
-        data = fin.read()
+    data = urllib.request.urlopen("https://opensky-network.org/api/states/all").read()
+    with open('temp.json', 'wb') as file:
+        file.write(data)
+    #with open('temp.json', 'rb') as fin:
+#        data = fin.read()
     output = json.loads(data)
     states = output["states"]
     return states
@@ -97,7 +99,9 @@ join v300 va on va.rid=va
 join u350 ub on ub.rid=ub
 join v350 vb on vb.rid=vb""")
     for r in result_set:
-        return sqrt(r[0] * r[0] + r[1] * r[1]) * d + sqrt(r[0] * r[0] + r[1] * r[1]) * (1 - d)
+        return r[0] * d + r[2] * (1 - d), r[1] * d + r[3] * (1 - d)
+        # sqrt(r[0] * r[0] + r[1] * r[1]) * d + sqrt(r[0] * r[0] + r[1] * r[1]) * (1 - d)
+    return None, None
 
 
 def saveVelocity(conn, t, x, y, z, velocity, speed, prognosisVelocit):
@@ -111,7 +115,7 @@ def saveVelocity(conn, t, x, y, z, velocity, speed, prognosisVelocit):
 
 
 def saveInfo(conn, info):
-    s = "insert into planes (t, z, planeVelocity, observedVelocity, windVelocity, v, geom) values "
+    s = "insert into planes (t, z, planeVelocity, observedVelocity, windVelocity, v, geom, typ) values "
     first = True
     for state in info:
         if first:
@@ -119,12 +123,37 @@ def saveInfo(conn, info):
         else:
             s += ",\n"
         s += "('" + str(state[0]) + "'::timestamp, " + str(state[3]) + ", " + str(state[5]) + ", " + str(
-            state[4]) + ", " + str(state[6]) + ", " + str(state[4] - state[5] - state[6]) + ", ST_MakePoint(" + str(
-            state[1]) + "," + str(state[2]) + "))"
-    conn.execute(s)
+            state[4]) + ", " + str(state[6]) + ", " + str(state[7]) + ", ST_MakePoint(" + str(
+            state[1]) + "," + str(state[2]) + "), '" + state[8] + "')"
+    var = conn.execute(s)
+    return var
 
 
-def getTable(states, speedDict, t):
+def calcError(windX, windY, velocity, deg, speed):
+    fx = velocity * cos(radians(90 - deg))
+    fy = velocity * sin(radians(90 - deg))
+    f = velocity
+    p = speed
+    w = sqrt(windX * windX + windY * windY)  # w*w*c*c - 2*(w,f)*c + (f*f-p*p)*w*w =0
+    s = windX * fx + windY * fy  # w*w*c*c - 2*s*c + (f*f-p*p) = 0
+    d4 = s * s - w * w * (f * f - p * p)  # a=w*w b=-2s c=(f*f-p*p)
+    if d4 > 0:
+        c1 = (s + sqrt(d4)) / w / w - 1
+        c2 = (s - sqrt(d4)) / w / w - 1
+        if abs(c1) > abs(c2):
+            return c2 * w
+        return c1 * w
+    elif d4 == 0:
+        return s / w - w
+    return None
+
+def calcPlaneSpeed(windX, windY, velocity, deg, speed):
+    fx = velocity * cos(radians(90 - deg)) - windX
+    fy = velocity * sin(radians(90 - deg)) - windY
+    w = sqrt(fx * fx + fy * fy)
+    return w-speed
+
+def getTable(states, speedDict, t, typeDict):
     cnt = 0
     requestCount = 0
     cntGood = 0
@@ -147,11 +176,15 @@ def getTable(states, speedDict, t):
             cntGood = cntGood + 1
             #        if cntGood < 100:
             windVelocity = velocity - speed  # m/s
-            prognosisVelocity = getVelocityFromDB(conn, x, y, z)
-            if prognosisVelocity is not None:
-                errorWindVelocity = windVelocity - prognosisVelocity
-                listVel.append(errorWindVelocity)
-                info.append([t, x, y, z, velocity, speed, prognosisVelocity]);
+            prognosisVelocityX, prognosisVelocityY = getVelocityFromDB(conn, x, y, z)
+            if prognosisVelocityX is not None and prognosisVelocityY is not None:
+                typ = typeDict.get(icao)
+                prognosisVelocity = sqrt(
+                    prognosisVelocityX * prognosisVelocityX + prognosisVelocityY * prognosisVelocityY)
+                errorWindVelocity = calcPlaneSpeed(prognosisVelocityX, prognosisVelocityY, velocity, deg, speed)
+                if errorWindVelocity is not None:
+                    listVel.append(errorWindVelocity)
+                    info.append([t, x, y, z, velocity, speed, prognosisVelocity, errorWindVelocity, typ]);
             #                saveVelocity(conn, t, x, y, z, velocity, speed, prognosisVelocity)
             requestCount += 1
             if requestCount % 100 == 0:
@@ -170,13 +203,13 @@ def getTable(states, speedDict, t):
 t = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 aircrafts = getAircrafts()
-speedDict = getAircraftSpeed(aircrafts)
+speedDict, typeDict = getAircraftSpeed(aircrafts)
 states = loadStates()
 
 states = filter(lambda state: state[13], states)
 states = sorted(states, key=itemgetter(13))
 
-windVelData = getTable(states, speedDict, t)
+windVelData = getTable(states, speedDict, t, typeDict)
 '''
 cnt = len(states)
 cntgood = 0
